@@ -1,104 +1,60 @@
-# web_app/app_fastapi.py
-from fastapi import FastAPI, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
-from typing import Optional, List
-import sys
-import os
+import asyncio
+import logging
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from maxapi import Bot, Dispatcher
+from maxapi.types import BotStarted, Command, MessageCreated
 
-from shared.database import init_db, get_session
-from shared.models import Staff, Student, Parent, ClassUnit
-from config import config
-from pydantic import BaseModel, ConfigDict
+from shared.database import get_session, init_database
+from shared.models import Staff
 
-# Инициализация при старте
-init_db(
-    db_path=config.DB_PATH,
-    pool_size=config.DB_POOL_SIZE,
-    max_overflow=config.DB_MAX_OVERFLOW
-)
+logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="School API")
+bot = Bot('f9LHodD0cOJyRwg2Wh9-AVQhw-8hcSkswc-QPVf2ejN0UA52QuOsMJkFRYuTfHDcaeDUS_P8u7Y3hlLjwvpq')
+dp = Dispatcher()
+
+# Инициализация БД
+engine = init_database()
 
 
-# Pydantic модели для ответов
-class StudentResponse(BaseModel):
-    id: int
-    full_name: str
-    class_name: Optional[str] = None
-    email: Optional[str] = None
-    phone: Optional[str] = None
-
-    model_config = ConfigDict(
-        from_attributes=True,
-        arbitrary_types_allowed=True
+# Ответ бота при нажатии на кнопку "Начать"
+@dp.bot_started()
+async def bot_started(event: BotStarted):
+    await event.bot.send_message(
+        chat_id=event.chat_id,
+        text='Привет! Отправь мне /start'
     )
 
 
-class StaffResponse(BaseModel):
-    id: int
-    name: str
-    email: Optional[str] = None
-    phone: Optional[str] = None
-    type: Optional[str] = None
-    classes: List[str] = []
-
-
-# Зависимость для получения сессии
-def get_db():
-    db = get_session()
+# Ответ бота на команду /start
+@dp.message_created(Command('start'))
+async def hello(event: MessageCreated):
+    # Создаем новую сессию для каждого запроса
+    session = get_session(engine)
     try:
-        yield db
+        # Ищем по person_id (ID из API), а не по внутреннему id
+        x = session.query(Staff).filter(Staff.person_id == 58).first()
+
+        if x:
+            await event.message.answer(
+                f"✅ Найден сотрудник:\n"
+                f"👤 Имя: {x.name}\n"
+                f"📧 Email: {x.email}\n"
+                f"📞 Телефон: {x.phone}\n"
+                f"🆔 Person ID: {x.person_id}"
+            )
+        else:
+            await event.message.answer("❌ Сотрудник с person_id=58 не найден")
+
+    except Exception as e:
+        await event.message.answer(f"❌ Ошибка: {e}")
+        logging.error(f"Database error: {e}")
     finally:
-        db.close()
+        session.close()  # Важно закрыть сессию
 
 
-@app.get("/api/students", response_model=List[StudentResponse])
-def get_students(
-        class_id: Optional[int] = Query(None),
-        name: Optional[str] = Query(None),
-        db: Session = Depends(get_db)
-):
-    """Получение списка учеников"""
-    query = db.query(Student).filter(Student.is_active == True)
-
-    if class_id:
-        query = query.filter(Student.class_unit_id == class_id)
-    if name:
-        query = query.filter(
-            (Student.last_name.ilike(f'%{name}%')) |
-            (Student.first_name.ilike(f'%{name}%'))
-        )
-
-    students = query.all()
-
-    return [
-        StudentResponse(
-            id=s.person_id,
-            full_name=s.full_name,
-            class_name=s.class_unit.name if s.class_unit else None,
-            email=s.email,
-            phone=s.phone
-        ) for s in students
-    ]
+async def main():
+    await dp.start_polling(bot)
 
 
-@app.get("/api/staff", response_model=StaffResponse)
-def get_staff(staff_id: int, db: Session = Depends(get_db)):
-    """Получение информации о сотруднике"""
-    staff = db.query(Staff).first()
-
-    if not staff:
-        raise HTTPException(status_code=404, detail="Staff not found")
-
-    return StaffResponse(
-        id=staff.person_id,
-        name=staff.full_name,
-        email=staff.email,
-        phone=staff.phone,
-        type=staff.type,
-        classes=[c.name for c in staff.classes]
-    )
-
-# Запуск: uvicorn web_app.app_fastapi:app --reload
+if __name__ == '__main__':
+    asyncio.run(main())

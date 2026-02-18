@@ -1,14 +1,18 @@
 """
 Модуль для синхронизации данных школы из API mos.ru
-Версия: 2.0
+Версия: 2.1 - с улучшенной обработкой rate limiting MAX API
 """
 # school_sync/school_sync.py
 import os
 import hashlib
+import re
+
 import requests
 import traceback
 import time
 from datetime import datetime, timedelta
+
+from bs4 import BeautifulSoup
 from sqlalchemy import and_, or_
 
 # СНАЧАЛА импортируем локальные модули, которые НЕ зависят от shared
@@ -67,6 +71,8 @@ class CacheManager:
             'misses': self.misses,
             'hit_rate': f"{hit_rate:.1f}%"
         }
+
+
 class SchoolDataCollector:
     """
     Основной класс для сбора и синхронизации данных школы
@@ -95,6 +101,14 @@ class SchoolDataCollector:
         self.backup = DatabaseBackup(self.db_path)  # Передаём тот же путь
         self.cache = CacheManager(cache_ttl=300)
 
+        # Добавляем счетчики для контроля запросов к MAX API
+        self.max_api_calls = 0
+        self.max_api_limit = 100  # Лимит запросов в минуту
+        self.max_api_reset_time = time.time() + 60
+
+        # Кэш для MAX данных
+        self._max_data_cache = {}
+
         try:
             # Подключение к БД
             self.engine = init_database(db_url)
@@ -104,83 +118,222 @@ class SchoolDataCollector:
             logger.error(f"Ошибка подключения к БД: {e}")
             raise
 
-    def bulk_save_staff(self, staff_data_list):
+    def _check_max_api_limit(self):
+        """Проверяет и сбрасывает счетчик запросов к MAX API"""
+        current_time = time.time()
+
+        # Сбрасываем счетчик каждую минуту
+        if current_time > self.max_api_reset_time:
+            self.max_api_calls = 0
+            self.max_api_reset_time = current_time + 60
+
+        # Если приближаемся к лимиту, делаем паузу
+        if self.max_api_calls >= self.max_api_limit - 10:
+            sleep_time = self.max_api_reset_time - current_time
+            if sleep_time > 0:
+                logger.warning(f"⚠️ Близок к лимиту MAX API. Ожидание {sleep_time:.1f} секунд...")
+                time.sleep(sleep_time)
+                self.max_api_calls = 0
+                self.max_api_reset_time = time.time() + 60
+
+        self.max_api_calls += 1
+
+    def _parse_max_user_id(self, html_text):
         """
-        Пакетное сохранение сотрудников для ускорения
+        Парсит HTML страницы MAX для получения user.id
+
+        Args:
+            html_text (str): HTML страницы
+
+        Returns:
+            str: MAX user ID или None
         """
-        if not staff_data_list:
-            return
-
-        # Собираем все ID для пакетного поиска
-        all_ids = [s.get('id') for s in staff_data_list if s.get('id')]
-
-        # Один запрос вместо множества
-        existing_staff = {
-            s.person_id: s
-            for s in self.session.query(Staff).filter(Staff.person_id.in_(all_ids))
-        }
-
-        new_staff = []
-        update_count = 0
-
-        for staff_data in staff_data_list:
-            staff_id = staff_data.get('id')
-            if not staff_id or not staff_data.get('user_id'):
-                continue
-
-            if staff_id in existing_staff:
-                # Обновляем существующего
-                staff = existing_staff[staff_id]
-                self._update_staff_object(staff, staff_data)
-                update_count += 1
-            else:
-                # Создаем нового
-                staff = self._create_staff_object(staff_data)
-                if staff:
-                    new_staff.append(staff)
-
-        # Пакетное добавление
-        if new_staff:
-            self.session.add_all(new_staff)
-
-        self.session.flush()
-        logger.info(f"Пакетная обработка: {len(new_staff)} новых, {update_count} обновлено")
-
-    def _create_staff_object(self, staff_data):
-        """Создает объект Staff из данных"""
         try:
-            user_data = staff_data.get('user', {})
-            full_name = staff_data.get('name', '')
-            last_name, first_name, middle_name = self.normalizer.extract_name_parts(full_name)
+            # Ищем паттерн data:{user:{id:123456,
+            pattern = r'data:\{user:\{id:(\d+),'
+            match = re.search(pattern, html_text)
+            if match:
+                return match.group(1)
 
-            return Staff(
-                person_id=staff_data['id'],
-                user_id=staff_data['user_id'],
-                name=full_name,
-                last_name=last_name,
-                first_name=first_name,
-                middle_name=middle_name,
-                email=self.normalizer.normalize_email(user_data.get('email')),
-                phone=self.normalizer.normalize_phone(user_data.get('phone_number')),
-                type=staff_data.get('type'),
-                updated_at_api=staff_data.get('updated_at'),
-                is_active=True,
-                last_seen_at=utc_now_naive()  # ДЛЯ БД нужно наивное время
-            )
+            # Альтернативный поиск через BeautifulSoup
+            soup = BeautifulSoup(html_text, 'html.parser')
+            scripts = soup.find_all('script')
+
+            for script in scripts:
+                if script.string and 'user:{id:' in script.string:
+                    match = re.search(r'user:\{id:(\d+),', script.string)
+                    if match:
+                        return match.group(1)
+
+            return None
         except Exception as e:
-            logger.error(f"Ошибка создания объекта Staff: {e}")
+            logger.debug(f"Ошибка парсинга MAX user.id: {e}")
             return None
 
-    def _update_staff_object(self, staff, staff_data):
-        """Обновляет существующий объект Staff"""
-        user_data = staff_data.get('user', {})
-        staff.last_seen_at = utc_now_naive()
-        staff.is_active = True
-        staff.deactivated_at = None
+    def get_max_data(self, person_id=None, staff_id=None, max_retries=3):
+        """
+        Получает MAX ID и ссылку для пользователя с обработкой ограничений по запросам
 
-        # Обновляем только если изменилось
-        if staff.updated_at_api != staff_data.get('updated_at'):
-            staff.updated_at_api = staff_data.get('updated_at')
+        Args:
+            person_id: ID ученика или родителя
+            staff_id: ID сотрудника
+            max_retries: Максимальное количество повторных попыток
+
+        Returns:
+            dict: {'max_id': str, 'max_link': str} или None
+        """
+        # Проверяем лимиты запросов
+        self._check_max_api_limit()
+
+        # Формируем URL с параметрами
+        if staff_id:
+            url = f"https://school.mos.ru/v2/external-partners/check-for-max-user?staff_id={staff_id}"
+            id_type = "staff"
+            id_value = staff_id
+        elif person_id:
+            url = f"https://school.mos.ru/v2/external-partners/check-for-max-user?person_id={person_id}"
+            id_type = "person"
+            id_value = person_id
+        else:
+            logger.error("Не указан ни person_id, ни staff_id")
+            return None
+
+        # Проверяем кэш перед запросом
+        cache_key = f"max_data_{id_type}_{id_value}"
+        if cache_key in self._max_data_cache:
+            cached = self._max_data_cache[cache_key]
+            logger.debug(f"✅ MAX data cache HIT for {id_type}:{id_value}")
+            return cached
+
+        logger.debug(f"Запрос к MAX API для {id_type}: {id_value}")
+
+        retry_count = 0
+        base_delay = 30  # Базовая задержка в секундах
+
+        while retry_count < max_retries:
+            try:
+                # Первый запрос к API mos.ru
+                response = requests.get(url, headers=self.headers, timeout=10)
+
+                # Обработка rate limiting
+                if response.status_code == 429:  # Too Many Requests
+                    retry_after = int(response.headers.get('Retry-After', base_delay))
+                    logger.warning(f"⚠️ Rate limit для MAX API. Ожидание {retry_after} секунд...")
+                    time.sleep(retry_after)
+                    retry_count += 1
+                    continue
+
+                if response.status_code != 200:
+                    logger.debug(f"MAX ID не найден для {url}: {response.status_code}")
+                    return None
+
+                data = response.json()
+                if not data or 'max_link' not in data:
+                    return None
+
+                max_link = data['max_link']
+
+                # Добавляем задержку между запросами
+                time.sleep(2)  # Увеличиваем задержку
+
+                # Второй запрос к MAX для получения HTML
+                try:
+                    html_response = requests.get(
+                        max_link,
+                        timeout=10,
+                        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                    )
+
+                    if html_response.status_code == 200:
+                        max_user_id = self._parse_max_user_id(html_response.text)
+
+                        result = {
+                            'max_id': max_user_id,
+                            'max_link': max_link
+                        }
+
+                        # Сохраняем в кэш
+                        self._max_data_cache[cache_key] = result
+
+                        if max_user_id:
+                            logger.debug(f"✅ Найден MAX user.id: {max_user_id} for {id_type}:{id_value}")
+                        else:
+                            logger.debug(f"⚠️ MAX user.id не найден в HTML для {id_type}:{id_value}")
+
+                        return result
+
+                    elif html_response.status_code == 429:
+                        # Rate limit от MAX
+                        retry_after = int(html_response.headers.get('Retry-After', base_delay))
+                        logger.warning(f"⚠️ Rate limit от MAX. Ожидание {retry_after} секунд...")
+                        time.sleep(retry_after)
+                        retry_count += 1
+                        continue
+                    else:
+                        logger.debug(f"MAX HTML вернул код {html_response.status_code} для {id_type}:{id_value}")
+
+                except requests.exceptions.RequestException as e:
+                    logger.debug(f"Ошибка при запросе к MAX: {e}")
+
+                # Если не удалось получить HTML, возвращаем None
+                return None
+
+            except requests.exceptions.RequestException as e:
+                logger.debug(f"Ошибка сети при получении MAX ID: {e}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    sleep_time = base_delay * retry_count
+                    logger.debug(f"Повторная попытка через {sleep_time} секунд...")
+                    time.sleep(sleep_time)
+
+            except Exception as e:
+                logger.debug(f"Ошибка при парсинге MAX ID: {e}")
+                return None
+
+        logger.warning(f"❌ Не удалось получить MAX данные после {max_retries} попыток для {id_type}:{id_value}")
+        return None
+
+    def batch_get_max_data(self, items, id_field='staff_id'):
+        """
+        Пакетное получение MAX ID для множества элементов
+
+        Args:
+            items: список словарей с ID
+            id_field: название поля с ID ('staff_id' или 'person_id')
+
+        Returns:
+            dict: {id: max_data}
+        """
+        results = {}
+        total_items = len(items)
+
+        logger.info(f"📦 Пакетное получение MAX ID для {total_items} элементов")
+
+        for i, item in enumerate(items):
+            item_id = item['id']
+
+            # Прогресс
+            if (i + 1) % 10 == 0:
+                logger.info(f"  Прогресс: {i + 1}/{total_items} ({((i + 1)/total_items*100):.1f}%)")
+
+            if id_field == 'staff_id':
+                max_data = self.get_max_data(staff_id=item_id, max_retries=2)
+            else:
+                max_data = self.get_max_data(person_id=item_id, max_retries=2)
+
+            results[item_id] = max_data
+
+            # Добавляем переменную задержку между запросами
+            if (i + 1) % 5 == 0:  # Каждые 5 запросов делаем паузу
+                sleep_time = 10  # Увеличиваем паузу
+                logger.debug(f"⏸️ Пауза после {i+1} запросов MAX API на {sleep_time} секунд")
+                time.sleep(sleep_time)
+            else:
+                # Небольшая задержка между запросами
+                time.sleep(2)
+
+        logger.info(f"✅ Пакетное получение MAX ID завершено")
+        return results
 
     def _api_request(self, endpoint, params=None):
         """
@@ -282,6 +435,18 @@ class SchoolDataCollector:
             except Exception as e:
                 logger.debug(f"Не удалось распарсить дату {api_date_str}: {e}")
 
+        # Получаем MAX ID с обработкой ошибок
+        try:
+            user_integration_id = staff_data.get('user_integration_id')
+            if user_integration_id:
+                max_data = self.get_max_data(staff_id=user_integration_id, max_retries=2)
+                max_id = max_data.get('max_id') if max_data else None
+            else:
+                max_id = None
+        except Exception as e:
+            max_id = None
+            logger.debug(f"Не удалось получить max_id для сотрудника {staff_id}: {e}")
+
         # Поиск в БД
         try:
             staff = self.session.query(Staff).filter_by(person_id=staff_id).first()
@@ -308,7 +473,8 @@ class SchoolDataCollector:
                     is_active=True,
                     last_seen_at=current_time,
                     created_at=current_time,
-                    updated_at=current_time
+                    updated_at=current_time,
+                    max_user_id=max_id
                 )
                 self.session.add(staff)
                 logger.info(f"✅ Добавлен сотрудник: {full_name or staff_id} (user_id: {user_id})")
@@ -325,6 +491,8 @@ class SchoolDataCollector:
                     changes.append("email")
                 if staff.phone != phone:
                     changes.append("телефон")
+                if staff.max_user_id != max_id:
+                    changes.append("макс")
                 if staff.type != staff_data.get('type'):
                     changes.append("тип")
 
@@ -341,6 +509,7 @@ class SchoolDataCollector:
                 staff.is_active = True
                 staff.last_seen_at = current_time
                 staff.deactivated_at = None
+                staff.max_user_id = max_id
                 staff.updated_at = current_time
 
                 if changes:
@@ -353,6 +522,84 @@ class SchoolDataCollector:
         except Exception as e:
             logger.error(f"Ошибка при сохранении сотрудника {staff_id}: {e}")
             return None
+
+    def bulk_save_staff(self, staff_data_list):
+        """
+        Пакетное сохранение сотрудников для ускорения
+        """
+        if not staff_data_list:
+            return
+
+        # Собираем все ID для пакетного поиска
+        all_ids = [s.get('id') for s in staff_data_list if s.get('id')]
+
+        # Один запрос вместо множества
+        existing_staff = {
+            s.person_id: s
+            for s in self.session.query(Staff).filter(Staff.person_id.in_(all_ids))
+        }
+
+        new_staff = []
+        update_count = 0
+
+        for staff_data in staff_data_list:
+            staff_id = staff_data.get('id')
+            if not staff_id or not staff_data.get('user_id'):
+                continue
+
+            if staff_id in existing_staff:
+                # Обновляем существующего
+                staff = existing_staff[staff_id]
+                self._update_staff_object(staff, staff_data)
+                update_count += 1
+            else:
+                # Создаем нового
+                staff = self._create_staff_object(staff_data)
+                if staff:
+                    new_staff.append(staff)
+
+        # Пакетное добавление
+        if new_staff:
+            self.session.add_all(new_staff)
+
+        self.session.flush()
+        logger.info(f"Пакетная обработка: {len(new_staff)} новых, {update_count} обновлено")
+
+    def _create_staff_object(self, staff_data):
+        """Создает объект Staff из данных"""
+        try:
+            user_data = staff_data.get('user', {})
+            full_name = staff_data.get('name', '')
+            last_name, first_name, middle_name = self.normalizer.extract_name_parts(full_name)
+
+            return Staff(
+                person_id=staff_data['id'],
+                user_id=staff_data['user_id'],
+                name=full_name,
+                last_name=last_name,
+                first_name=first_name,
+                middle_name=middle_name,
+                email=self.normalizer.normalize_email(user_data.get('email')),
+                phone=self.normalizer.normalize_phone(user_data.get('phone_number')),
+                type=staff_data.get('type'),
+                updated_at_api=staff_data.get('updated_at'),
+                is_active=True,
+                last_seen_at=utc_now_naive()  # ДЛЯ БД нужно наивное время
+            )
+        except Exception as e:
+            logger.error(f"Ошибка создания объекта Staff: {e}")
+            return None
+
+    def _update_staff_object(self, staff, staff_data):
+        """Обновляет существующий объект Staff"""
+        user_data = staff_data.get('user', {})
+        staff.last_seen_at = utc_now_naive()
+        staff.is_active = True
+        staff.deactivated_at = None
+
+        # Обновляем только если изменилось
+        if staff.updated_at_api != staff_data.get('updated_at'):
+            staff.updated_at_api = staff_data.get('updated_at')
 
     def sync_all_staff(self):
         """
@@ -376,14 +623,28 @@ class SchoolDataCollector:
 
         page = 1
         page_processed_ids = set()
+        max_api_retries = 3
 
         while True:
             logger.info(f"Загрузка страницы {page}...")
 
-            data = self._api_request('teacher_profiles', {
-                'school_id': self.school_id,
-                'page': page
-            })
+            # Добавляем повторные попытки при ошибках API
+            for attempt in range(max_api_retries):
+                data = self._api_request('teacher_profiles', {
+                    'school_id': self.school_id,
+                    'page': page
+                })
+
+                if data is not None:
+                    break
+
+                if attempt < max_api_retries - 1:
+                    wait_time = 10 * (attempt + 1)
+                    logger.warning(f"Ошибка загрузки страницы {page}, попытка {attempt + 2} через {wait_time}с")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Не удалось загрузить страницу {page} после {max_api_retries} попыток")
+                    data = None
 
             if not data:
                 break
@@ -444,6 +705,10 @@ class SchoolDataCollector:
 
                     # Сохранение
                     staff = self.save_staff_from_api(staff_data)
+
+                    # Увеличиваем задержку между сохранениями
+                    time.sleep(1)
+
                     if staff:
                         stats['saved_ids'].add(staff.person_id)
                         page_processed_ids.add(staff_id)
@@ -475,7 +740,7 @@ class SchoolDataCollector:
                 break
 
             page += 1
-            time.sleep(0.5)
+            time.sleep(1)  # Увеличиваем задержку между страницами
 
         # Деактивация отсутствующих
         deactivated = self.deactivate_missing_staff(stats['saved_ids'])
@@ -501,6 +766,9 @@ class SchoolDataCollector:
         logger.info(f"Очищено (без user_id): {cleaned}")
         logger.info(f"Ошибок: {stats['errors']}")
         logger.info(f"Дубликатов: {stats['duplicates']}")
+
+        # Статистика кэша MAX API
+        logger.info(f"MAX API кэш: {len(self._max_data_cache)} записей")
 
         return stats
 
@@ -689,6 +957,18 @@ class SchoolDataCollector:
         if not student_id:
             return None, "Пропущен"
 
+        # Получаем MAX ID
+        try:
+            person_id = student_data.get('person_id')
+            if person_id:
+                max_data = self.get_max_data(person_id=person_id, max_retries=2)
+                max_id = max_data.get('max_id') if max_data else None
+            else:
+                max_id = None
+        except Exception as e:
+            logger.debug(f"Не удалось получить max_id для ученика {student_id}: {e}")
+            max_id = None
+
         # Нормализация контактов
         phone = self.normalizer.normalize_phone(student_data.get('phone_number'))
         email = self.normalizer.normalize_email(student_data.get('email_ezd'))
@@ -705,6 +985,7 @@ class SchoolDataCollector:
                 email=email,
                 phone=phone,
                 class_unit_id=class_unit_id,
+                max_user_id=max_id,
                 is_active=True
             )
             self.session.add(student)
@@ -729,6 +1010,7 @@ class SchoolDataCollector:
             student.class_unit_id = class_unit_id
             student.is_active = True
             student.deactivated_at = None
+            student.max_user_id = max_id
             student.updated_at = utc_now_naive()
 
             if old_data != new_data:
@@ -774,6 +1056,18 @@ class SchoolDataCollector:
 
         parent = self.session.query(Parent).filter_by(person_id=parent_id).first()
 
+        # Получаем MAX ID
+        try:
+            person_id = parent_data.get('person_id')
+            if person_id:
+                max_data = self.get_max_data(person_id=person_id, max_retries=2)
+                max_id = max_data.get('max_id') if max_data else None
+            else:
+                max_id = None
+        except Exception as e:
+            logger.debug(f"Не удалось получить max_id для родителя {parent_id}: {e}")
+            max_id = None
+
         if not parent:
             parent = Parent(
                 person_id=parent_id,
@@ -783,6 +1077,7 @@ class SchoolDataCollector:
                 middle_name=middle_name,
                 email=email,
                 phone=phone,
+                max_user_id=max_id,
                 is_active=True
             )
             self.session.add(parent)
@@ -796,6 +1091,7 @@ class SchoolDataCollector:
             parent.phone = phone or parent.phone
             parent.is_active = True
             parent.deactivated_at = None
+            parent.max_user_id = max_id
             parent.updated_at = utc_now_naive()
             action = "Обновлен"
 
@@ -841,15 +1137,29 @@ class SchoolDataCollector:
         """
         logger.info(f"📊 Обработка класса ID: {unit_id}")
 
-        data = self._api_request('student_profiles', {
-            "page": "1",
-            "class_unit_ids": str(unit_id),
-            "with_deleted": "false",
-            "with_parents": "true",
-            "with_user_info": "true"
-        })
+        # Добавляем повторные попытки при ошибках
+        max_retries = 3
+        data = None
+
+        for attempt in range(max_retries):
+            data = self._api_request('student_profiles', {
+                "page": "1",
+                "class_unit_ids": str(unit_id),
+                "with_deleted": "false",
+                "with_parents": "true",
+                "with_user_info": "true"
+            })
+
+            if data is not None:
+                break
+
+            if attempt < max_retries - 1:
+                wait_time = 10 * (attempt + 1)
+                logger.warning(f"Ошибка загрузки класса {unit_id}, попытка {attempt + 2} через {wait_time}с")
+                time.sleep(wait_time)
 
         if not data:
+            logger.error(f"Не удалось загрузить данные класса {unit_id}")
             return
 
         if not isinstance(data, list):
@@ -868,13 +1178,17 @@ class SchoolDataCollector:
 
         # Обработка учеников
         students_count = 0
-        for student_data in data:
+        for idx, student_data in enumerate(data):
             if not isinstance(student_data, dict):
                 continue
 
             student, _ = self.save_student_data(student_data, unit_id)
             if student:
                 students_count += 1
+
+            # Добавляем задержку между обработкой учеников
+            if (idx + 1) % 10 == 0:
+                time.sleep(2)
 
         # Деактивация отсутствующих
         if current_ids:
@@ -922,13 +1236,19 @@ class SchoolDataCollector:
             Staff.email.isnot(None), Staff.is_active == True
         ).count()
 
+        # MAX ID статистика
+        with_max_id = self.session.query(Staff).filter(
+            Staff.max_user_id.isnot(None), Staff.is_active == True
+        ).count()
+
         return {
             'total': total,
             'active': active,
             'deactivated': deactivated,
             'by_type': types,
             'with_phone': with_phone,
-            'with_email': with_email
+            'with_email': with_email,
+            'with_max_id': with_max_id
         }
 
     def print_staff_statistics(self):
@@ -943,6 +1263,7 @@ class SchoolDataCollector:
         logger.info(f"🔴 Деактивированных: {stats['deactivated']}")
         logger.info(f"📞 С телефоном: {stats['with_phone']}")
         logger.info(f"📧 С email: {stats['with_email']}")
+        logger.info(f"🆔 С MAX ID: {stats['with_max_id']}")
 
         if stats['by_type']:
             logger.info("\n📋 По типам:")
@@ -1023,7 +1344,8 @@ class SchoolDataCollector:
                 'phone': staff.phone,
                 'type': staff.type,
                 'classes': [c.name for c in staff.classes],
-                'last_seen': staff.last_seen_at
+                'last_seen': staff.last_seen_at,
+                'max_user_id': staff.max_user_id
             }
         return None
 
@@ -1129,6 +1451,7 @@ class SchoolDataCollector:
 
         if len(inactive) > limit:
             logger.info(f"     ... и еще {len(inactive) - limit}")
+
     def close(self):
         """Закрывает сессию БД"""
         self.session.close()
@@ -1178,8 +1501,8 @@ def main():
             collector.show_problematic_staff()
 
         # Синхронизация персонала
-        collector.sync_all_staff()
-        collector.print_staff_statistics()
+        # collector.sync_all_staff()
+        # collector.print_staff_statistics()
 
         # Показ неактивных
         collector.show_inactive_staff()
@@ -1189,6 +1512,7 @@ def main():
         logger.info("📚 ПОЛУЧЕНИЕ КЛАССОВ")
         logger.info("=" * 70)
 
+        # Раскомментируйте когда будете готовы синхронизировать классы
         class_data = collector._api_request('class_units', {'with_home_based': 'true'})
 
         if class_data:

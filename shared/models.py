@@ -54,11 +54,16 @@ class Staff(Base):
         Index('ix_staff_is_active', 'is_active'),
         Index('ix_staff_active_type', 'is_active', 'type'),
         Index('ix_staff_updated_api', 'updated_at_api'),
+        Index('ix_staff_max_user_id', 'max_user_id'),  # Новый индекс
     )
 
     id = Column(Integer, primary_key=True)
     person_id = Column(Integer, nullable=False)
     user_id = Column(Integer, nullable=True)
+
+    # Новое поле для MAX ID
+    max_user_id = Column(String(255), nullable=True,
+                         unique=True)  # unique=True если ID уникальны для всех пользователей
 
     name = Column(String(200), nullable=True)
     last_name = Column(String(100), nullable=True)
@@ -105,7 +110,8 @@ class ClassUnit(Base):
     name = Column(String(50), nullable=False)
     parallel = Column(String(10), nullable=True)
     literal = Column(String(10), nullable=True)
-
+    max_user_id = Column(String(11), nullable=True)
+    max_link = Column(String(11), nullable=True)
     students = relationship("Student", back_populates="class_unit", cascade="all, delete-orphan")
     staff = relationship("Staff", secondary=class_staff, back_populates="classes")
 
@@ -131,11 +137,15 @@ class Student(Base):
         Index('ix_student_is_active', 'is_active'),
         Index('ix_student_name', 'last_name', 'first_name'),
         Index('ix_student_active_class', 'is_active', 'class_unit_id'),
+        Index('ix_student_max_user_id', 'max_user_id'),  # Новый индекс
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     person_id = Column(Integer, nullable=False)
     user_name = Column(String(100), nullable=True)
+
+    # Новое поле для MAX ID
+    max_user_id = Column(String(255), nullable=True, unique=True)
 
     last_name = Column(String(100), nullable=False)
     first_name = Column(String(100), nullable=False)
@@ -175,10 +185,14 @@ class Parent(Base):
         Index('ix_parent_person_id', 'person_id', unique=True),
         Index('ix_parent_is_active', 'is_active'),
         Index('ix_parent_name', 'last_name', 'first_name'),
+        Index('ix_parent_max_user_id', 'max_user_id'),  # Новый индекс
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     person_id = Column(Integer, nullable=False)
+
+    # Новое поле для MAX ID
+    max_user_id = Column(String(255), nullable=True, unique=True)
 
     name = Column(String(200), nullable=True)
     last_name = Column(String(100), nullable=True)
