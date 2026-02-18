@@ -447,10 +447,13 @@ class SchoolDataCollector:
             if user_integration_id:
                 max_data = self.get_max_data(staff_id=user_integration_id, max_retries=2)
                 max_id = max_data.get('max_id') if max_data else None
+                max_link_path = max_data.get('max_link') if max_data else None
             else:
                 max_id = None
+                max_link_path = None
         except Exception as e:
             max_id = None
+            max_link_path = None
             logger.debug(f"Не удалось получить max_id для сотрудника {staff_id}: {e}")
 
         # Поиск в БД
@@ -473,6 +476,7 @@ class SchoolDataCollector:
                     first_name=first_name,
                     middle_name=middle_name,
                     email=email,
+                    max_link_path=max_link_path,
                     phone=phone,
                     type=staff_data.get('type'),
                     updated_at_api=api_updated_at,  # Теперь это datetime или None
@@ -516,6 +520,7 @@ class SchoolDataCollector:
                 staff.last_seen_at = current_time
                 staff.deactivated_at = None
                 staff.max_user_id = max_id
+                staff.max_link_path = max_link_path
                 staff.updated_at = current_time
 
                 if changes:
@@ -969,11 +974,15 @@ class SchoolDataCollector:
             if person_id:
                 max_data = self.get_max_data(person_id=person_id, max_retries=2)
                 max_id = max_data.get('max_id') if max_data else None
+                max_link_path = max_data.get('max_url') if max_data else None
+
             else:
                 max_id = None
+                max_link_path = None
         except Exception as e:
             logger.debug(f"Не удалось получить max_id для ученика {student_id}: {e}")
             max_id = None
+            max_link_path = None
 
         # Нормализация контактов
         phone = self.normalizer.normalize_phone(student_data.get('phone_number'))
@@ -992,6 +1001,7 @@ class SchoolDataCollector:
                 phone=phone,
                 class_unit_id=class_unit_id,
                 max_user_id=max_id,
+                max_link_path=max_link_path,
                 is_active=True
             )
             self.session.add(student)
@@ -1017,6 +1027,7 @@ class SchoolDataCollector:
             student.is_active = True
             student.deactivated_at = None
             student.max_user_id = max_id
+            student.max_link_path = max_link_path
             student.updated_at = utc_now_naive()
 
             if old_data != new_data:
@@ -1068,11 +1079,15 @@ class SchoolDataCollector:
             if person_id:
                 max_data = self.get_max_data(person_id=person_id, max_retries=2)
                 max_id = max_data.get('max_id') if max_data else None
+                max_link_path = max_data.get('max_url') if max_data else None
+
             else:
                 max_id = None
+                max_link_path = None
         except Exception as e:
             logger.debug(f"Не удалось получить max_id для родителя {parent_id}: {e}")
             max_id = None
+            max_link_path = None
 
         if not parent:
             parent = Parent(
@@ -1084,6 +1099,7 @@ class SchoolDataCollector:
                 email=email,
                 phone=phone,
                 max_user_id=max_id,
+                max_link_path=max_link_path,
                 is_active=True
             )
             self.session.add(parent)
@@ -1098,6 +1114,7 @@ class SchoolDataCollector:
             parent.is_active = True
             parent.deactivated_at = None
             parent.max_user_id = max_id
+            parent.max_link_path = max_link_path
             parent.updated_at = utc_now_naive()
             action = "Обновлен"
 
