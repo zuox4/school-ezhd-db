@@ -18,8 +18,9 @@ class Parent(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    person_id = Column(Integer, nullable=False)
+    person_id = Column(String(255), nullable=False)
     max_user_id = Column(String(255), nullable=True, unique=True)
+    max_link_path = Column(String(255), nullable=True, unique=True)
 
     # Персональные данные
     name = Column(String(200), nullable=True)

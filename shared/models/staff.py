@@ -23,7 +23,7 @@ class Staff(Base):
     person_id = Column(Integer, nullable=False)
     user_id = Column(Integer, nullable=True)
     max_user_id = Column(String(255), nullable=True, unique=True)
-
+    max_link_path = Column(String(255), nullable=True, unique=True)
     # Персональные данные
     name = Column(String(200), nullable=True)
     last_name = Column(String(100), nullable=True)

@@ -9,7 +9,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Настройки подключения
-SQLALCHEMY_DATABASE_URL = "sqlite:///./school.db"
+SQLALCHEMY_DATABASE_URL = "postgresql://school_admin:xzSAwq21!@192.168.21.6/test_school_unify_db"
+
+
 
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,

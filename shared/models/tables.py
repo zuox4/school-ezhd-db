@@ -11,7 +11,7 @@ class_staff = Table(
     Column('id', Integer, primary_key=True, autoincrement=True),
     Column('class_unit_id', Integer, ForeignKey('class_units.id', ondelete='CASCADE')),
     Column('staff_id', Integer, ForeignKey('staff.id', ondelete='CASCADE')),
-    Column('is_leader', Boolean, default=False, server_default=text('0')),
+    Column('is_leader', Boolean, default=False, server_default='false'),
     Column('subject', String(100), nullable=True),
     Column('created_at', DateTime, default=get_db_time),
     UniqueConstraint('class_unit_id', 'staff_id', name='uq_class_staff'),
