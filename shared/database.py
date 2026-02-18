@@ -1,91 +1,65 @@
-# shared/database.py
+"""Database configuration and session management."""
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, scoped_session
-from sqlalchemy.pool import QueuePool
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
+from typing import Generator
+import logging
 
-# Глобальные переменные
-db_session = None
-engine = None
+logger = logging.getLogger(__name__)
 
+# Настройки подключения
+SQLALCHEMY_DATABASE_URL = "sqlite:///./school.db"
 
-def init_database(database_url="sqlite:///school.db", echo=False):
-    """
-    Инициализирует базу данных и возвращает engine
-    """
-    engine = create_engine(
-        database_url,
-        echo=echo,
-        connect_args={'check_same_thread': False} if 'sqlite' in database_url else {}
-    )
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    connect_args={"check_same_thread": False} if "sqlite" in SQLALCHEMY_DATABASE_URL else {}
+)
 
-    from .models import Base
-    Base.metadata.create_all(engine)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-    return engine
+Base = declarative_base()
 
+def init_database(*args, **kwargs):
+    """Инициализация базы данных (с поддержкой любых аргументов)"""
+    from . import models
 
-def init_db(db_path="school.db", pool_size=5, max_overflow=10):
-    """
-    Инициализация подключения к БД с пулом соединений
-    """
-    global engine, db_session
+    drop_all = False
+    if args and len(args) > 0:
+        drop_all = bool(args[0])
+    if 'drop_all' in kwargs:
+        drop_all = bool(kwargs['drop_all'])
 
-    db_url = f"sqlite:///{db_path}"
+    if drop_all:
+        logger.warning("Удаление всех таблиц!")
+        Base.metadata.drop_all(bind=engine)
 
-    engine = create_engine(
-        db_url,
-        echo=False,
-        poolclass=QueuePool,
-        pool_size=pool_size,
-        max_overflow=max_overflow,
-        pool_pre_ping=True,
-        pool_recycle=3600,
-        connect_args={'check_same_thread': False}
-    )
+    logger.info("Создание таблиц...")
+    Base.metadata.create_all(bind=engine)
+    logger.info("Таблицы успешно созданы")
 
-    from .models import Base
-    Base.metadata.create_all(engine)
-
-    session_factory = sessionmaker(bind=engine)
-    db_session = scoped_session(session_factory)
-
-    return engine, db_session
-
-
-def get_session(engine=None):
-    """Получение сессии для работы с БД"""
-    global db_session
-
-    if engine:
-        # Если передан engine, создаем новую сессию
-        Session = sessionmaker(bind=engine)
-        return Session()
-
-    # Иначе используем глобальную сессию
-    if db_session is None:
-        raise Exception("Database not initialized. Call init_db() first.")
-    return db_session
-
+def get_session(*args, **kwargs) -> Session:
+    """Получение сессии (игнорирует аргументы)"""
+    return SessionLocal()
 
 @contextmanager
 def session_scope():
     """Контекстный менеджер для автоматического закрытия сессии"""
-    session = get_session()
+    session = SessionLocal()
     try:
         yield session
         session.commit()
-    except Exception:
+    except Exception as e:
         session.rollback()
+        logger.error(f"Ошибка при работе с БД: {e}")
         raise
     finally:
         session.close()
 
-
-def close_db():
-    """Закрытие всех соединений"""
-    global db_session, engine
-    if db_session:
-        db_session.remove()
-    if engine:
-        engine.dispose()
+def get_db() -> Generator:
+    """Зависимость для FastAPI"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

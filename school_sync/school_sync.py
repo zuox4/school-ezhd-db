@@ -24,7 +24,7 @@ from utils import DataNormalizer
 # ПОТОМ импортируем из shared
 from shared.models import Staff, ClassUnit, Student, Parent, class_staff, parent_student
 from shared.database import get_session, init_database  # Добавить init_database
-# ... остальной код ...
+
 
 
 class CacheManager:
@@ -81,6 +81,11 @@ class SchoolDataCollector:
     def __init__(self, headers, school_id=28, db_path=None):
         """
         Инициализация коллектора данных
+
+        Args:
+            headers: Заголовки для HTTP запросов
+            school_id: ID школы
+            db_path: Путь к файлу базы данных (опционально)
         """
         if db_path is None:
             # Используем абсолютный путь относительно текущей директории
@@ -92,9 +97,6 @@ class SchoolDataCollector:
         self.headers = headers
         self.school_id = school_id
         self.base_url = "https://school.mos.ru/api/ej/core/teacher/v1"
-
-        # Формируем правильный URL для SQLAlchemy
-        db_url = f"sqlite:///{self.db_path}"
 
         # Инициализация компонентов
         self.normalizer = DataNormalizer()
@@ -110,9 +112,13 @@ class SchoolDataCollector:
         self._max_data_cache = {}
 
         try:
-            # Подключение к БД
-            self.engine = init_database(db_url)
-            self.session = get_session(self.engine)
+            # ИНИЦИАЛИЗАЦИЯ БД ПО-НОВОМУ:
+            # 1. Инициализируем базу данных с указанным URL
+            self.engine = init_database()
+
+            # 2. Получаем сессию (без аргументов, так как get_session больше не принимает engine)
+            self.session = get_session()
+
             logger.info(f"Подключение к БД успешно: {self.db_path}")
         except Exception as e:
             logger.error(f"Ошибка подключения к БД: {e}")

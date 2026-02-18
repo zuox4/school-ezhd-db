@@ -1,17 +1,12 @@
-# shared/utils.py
+"""Utility functions."""
 from datetime import datetime, timezone
 
 def utc_now():
-    """
-    Возвращает текущее время в UTC с таймзоной для использования в Python
-    (для сравнений, кэширования, логирования)
-    """
+    """Текущее время в UTC с таймзоной."""
     return datetime.now(timezone.utc)
 
 def utc_now_naive():
-    """
-    Возвращает наивное UTC время (без таймзоны) для сохранения в БД.
-    """
+    """Наивное UTC время для БД."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # Алиас для использования в моделях
